@@ -15,10 +15,9 @@ pipeline {
 
         stage('Terraform Init & Plan') {
             steps {
-                // FIXED: Using AmazonWebServicesCredentialsBinding instead of usernamePassword
                 withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'AWS_Aadii', accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
-                    bat "terraform init"
-                    bat "terraform plan -out=tfplan"
+                    bat "terraform init -no-color"
+                    bat "terraform plan -out=tfplan -no-color"
                 }
             }
         }
@@ -26,14 +25,24 @@ pipeline {
         stage('Terraform Apply (Provision)') {
             steps {
                 withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'AWS_Aadii', accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
-                    bat "terraform apply -auto-approve tfplan"
+                    bat "terraform apply -auto-approve -no-color tfplan"
                     
                     script {
-                        // Capture IP
-                        def ipRaw = bat(script: "terraform output -raw instance_ip", returnStdout: true).trim()
-                        // Filter just the last line to get the clean IP
-                        env.INSTANCE_IP = ipRaw.readLines().last().trim() 
-                        echo "Instance IP is: ${env.INSTANCE_IP}"
+                        // 1. Get the raw output from Terraform
+                        def outputRaw = bat(script: "terraform output -raw instance_ip", returnStdout: true).trim()
+                        
+                        echo "Debug - Raw Output: ${outputRaw}"
+
+                        // 2. USE REGEX to extract ONLY the IP address (Ignore weird symbols)
+                        // This looks for pattern: number.number.number.number
+                        def matcher = (outputRaw =~ /\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/)
+                        
+                        if (matcher.find()) {
+                            env.INSTANCE_IP = matcher.group()
+                            echo "SUCCESS: Found Clean IP: ${env.INSTANCE_IP}"
+                        } else {
+                            error "FAILED: Could not find an IP address in the output. Check Terraform code."
+                        }
                     }
                 }
             }
@@ -61,9 +70,11 @@ pipeline {
             steps {
                 withCredentials([sshUserPrivateKey(credentialsId: 'Aadii_new', keyFileVariable: 'SSH_KEY')]) {
                     script {
+                         // Create inventory in Windows
                          bat "echo [web] > inventory.ini"
-                         bat "echo %INSTANCE_IP% >> inventory.ini"
+                         bat "echo ${env.INSTANCE_IP} >> inventory.ini"
 
+                         // Run Ansible in WSL
                          bat """
                             @echo off
                             wsl cp \$(wslpath '%SSH_KEY%') /tmp/Aadii_new.pem
@@ -92,7 +103,7 @@ pipeline {
         stage('Terraform Destroy') {
             steps {
                 withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'AWS_Aadii', accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
-                    bat "terraform destroy -auto-approve"
+                    bat "terraform destroy -auto-approve -no-color"
                 }
             }
         }
