@@ -1,10 +1,9 @@
 pipeline {
     agent any
-
+    
     environment {
-        AWS_ACCESS_KEY_ID     = credentials('aws-access-key')     // Ensure these are set in Jenkins
-        AWS_SECRET_ACCESS_KEY = credentials('aws-secret-key')
-        TF_VAR_private_key    = '/var/lib/jenkins/my-key.pem'     // Path to your .pem key on Jenkins server
+        AWS_DEFAULT_REGION = 'us-east-1'
+        TF_IN_AUTOMATION   = 'true'
     }
 
     stages {
@@ -16,48 +15,72 @@ pipeline {
 
         stage('Terraform Init & Plan') {
             steps {
-                sh 'terraform init'
-                sh 'terraform plan -out=tfplan'
+                // EXPLICITLY binding keys to standard AWS env vars to fix "Access Key Error"
+                withCredentials([usernamePassword(credentialsId: 'AWS_Aadii', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                    bat "terraform init"
+                    bat "terraform plan -out=tfplan"
+                }
             }
         }
 
-        stage('Terraform Apply (Provision Instance)') {
+        stage('Terraform Apply (Provision)') {
             steps {
-                sh 'terraform apply -auto-approve tfplan'
-                // Save IP to a file for Ansible to use
-                sh 'terraform output -raw instance_ip > instance_ip.txt'
+                withCredentials([usernamePassword(credentialsId: 'AWS_Aadii', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                    bat "terraform apply -auto-approve tfplan"
+                    
+                    // Capture IP and save to environment variable for later stages
+                    script {
+                        def ipRaw = bat(script: "terraform output -raw instance_ip", returnStdout: true).trim()
+                        // Clean up Windows command output artifacts if necessary
+                        env.INSTANCE_IP = ipRaw.readLines().last().trim() 
+                        echo "Instance IP is: ${env.INSTANCE_IP}"
+                    }
+                }
             }
         }
 
         stage('Wait for Instance Boot') {
             steps {
-                sleep 60 // Give EC2 time to initialize SSH
+                echo "Waiting 60 seconds for EC2 to initialize..."
+                sleep 60 
             }
         }
 
         // --- MANUAL STEP 1: ASK TO RUN ANSIBLE ---
         stage('Approval for Configuration') {
             input {
-                message "Instance launched. Do you want to install Grafana via Ansible?"
+                message "Instance Launched (${env.INSTANCE_IP}). Install Grafana via Ansible?"
                 ok "Yes, Configure"
             }
             steps {
-                echo "Proceeding with Ansible configuration..."
+                echo "Proceeding with Ansible..."
             }
         }
 
-        stage('Run Ansible (Install Grafana)') {
+        stage('Run Ansible (WSL)') {
             steps {
-                script {
-                    def ip = readFile('instance_ip.txt').trim()
-                    sh """
-                        # Create a temporary inventory file
-                        echo "[web]" > inventory
-                        echo "${ip} ansible_user=ubuntu ansible_ssh_private_key_file=${env.TF_VAR_private_key} ansible_ssh_common_args='-o StrictHostKeyChecking=no'" >> inventory
-                        
-                        # Run Playbook
-                        ansible-playbook -i inventory playbook.yml
-                    """
+                // Using your 'Aadii_new' SSH key
+                withCredentials([sshUserPrivateKey(credentialsId: 'Aadii_new', keyFileVariable: 'SSH_KEY')]) {
+                    script {
+                         // We must generate the inventory file dynamically on Windows first
+                         bat "echo [web] > inventory.ini"
+                         bat "echo %INSTANCE_IP% >> inventory.ini"
+
+                         // Pass the Windows path key to WSL and run Ansible
+                         bat """
+                            @echo off
+                            :: 1. Copy key to a temp location in WSL so permissions work (chmod 400)
+                            wsl cp \$(wslpath '%SSH_KEY%') /tmp/Aadii_new.pem
+                            wsl chmod 400 /tmp/Aadii_new.pem
+
+                            :: 2. Run Ansible Playbook using WSL
+                            :: Note: We map the Windows 'inventory.ini' to the WSL path
+                            wsl ansible-playbook -i inventory.ini playbook.yml --private-key /tmp/Aadii_new.pem -u ubuntu --ssh-common-args='-o StrictHostKeyChecking=no'
+
+                            :: 3. Cleanup key
+                            wsl rm /tmp/Aadii_new.pem
+                         """
+                    }
                 }
             }
         }
@@ -65,17 +88,19 @@ pipeline {
         // --- MANUAL STEP 2: ASK TO DESTROY ---
         stage('Approval for Destroy') {
             input {
-                message "Work finished? Do you want to destroy the infrastructure?"
-                ok "Yes, Destroy Everything"
+                message "Testing Complete. Destroy Infrastructure?"
+                ok "Yes, Destroy"
             }
             steps {
-                echo "Proceeding to destroy infrastructure..."
+                echo "Destroying..."
             }
         }
 
         stage('Terraform Destroy') {
             steps {
-                sh 'terraform destroy -auto-approve'
+                withCredentials([usernamePassword(credentialsId: 'AWS_Aadii', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                    bat "terraform destroy -auto-approve"
+                }
             }
         }
     }
