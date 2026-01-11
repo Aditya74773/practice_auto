@@ -1,154 +1,105 @@
 pipeline {
     agent any
-
+    
     environment {
-        TF_IN_AUTOMATION = 'true'
-        TF_CLI_ARGS = '-no-color'
-        AWS_REGION = 'us-east-1' 
-        WSL_SSH_KEY = '/home/adii_linux/.ssh/id_rsa'
+        AWS_DEFAULT_REGION = 'us-east-1'
+        TF_IN_AUTOMATION   = 'true'
     }
 
     stages {
-        stage('Setup Environment') {
+        stage('Checkout') {
             steps {
-                script {
-                    // Detect branch name
-                    def branch = env.GIT_BRANCH ?: env.BRANCH_NAME ?: bat(script: "@git rev-parse --abbrev-ref HEAD", returnStdout: true).trim()
-                    env.CLEAN_BRANCH = branch.contains('/') ? branch.split('/')[-1] : branch
-                    echo "Successfully detected branch: ${env.CLEAN_BRANCH}"
+                checkout scm
+            }
+        }
+
+        stage('Terraform Init & Plan') {
+            steps {
+                // EXPLICITLY binding keys to standard AWS env vars to fix "Access Key Error"
+                withCredentials([usernamePassword(credentialsId: 'AWS_Aadii', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                    bat "terraform init"
+                    bat "terraform plan -out=tfplan"
+                }
+            }
+        }
+
+        stage('Terraform Apply (Provision)') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'AWS_Aadii', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                    bat "terraform apply -auto-approve tfplan"
                     
-                    // Verify .tfvars file
-                    def tfvarsFile = "${env.CLEAN_BRANCH}.tfvars"
-                    def fileExists = bat(script: "@if exist ${tfvarsFile} (echo true) else (echo false)", returnStdout: true).trim()
-                    
-                    if (fileExists == "false") {
-                        error "ABORTING: No variable file found for this branch. Please create ${tfvarsFile}."
-                    }
-                }
-            }
-        }
-
-        stage('Terraform Initialization') {
-            steps {
-                withCredentials([aws(credentialsId: 'AWS_Aadii', accesskeyVariable: 'AWS_ACCESS_KEY_ID', secretkeyVariable: 'AWS_SECRET_ACCESS_KEY')]) {
-                    bat 'terraform init'
-                    bat "terraform plan -var-file=${env.CLEAN_BRANCH}.tfvars"
-                }
-            }
-        }
-
-        stage('Validate Apply') {
-            steps {
-                script {
-                    if (env.CLEAN_BRANCH != 'main') {
-                        input message: "Do you want to apply the plan for ${env.CLEAN_BRANCH}?", ok: "Apply"
-                    } else {
-                        echo "Main branch: proceeding with deployment."
-                    }
-                }
-            }
-        }
-
-        stage('Terraform Provisioning') {
-            steps {
-                withCredentials([aws(credentialsId: 'AWS_Aadii', accesskeyVariable: 'AWS_ACCESS_KEY_ID', secretkeyVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                    // Capture IP and save to environment variable for later stages
                     script {
-                        bat "terraform apply -auto-approve -var-file=${env.CLEAN_BRANCH}.tfvars"
-                        
-                        // Extract outputs using PowerShell
-                        env.INSTANCE_IP = powershell(script: 'terraform output -raw instance_public_ip', returnStdout: true).trim()
-                        env.INSTANCE_ID = powershell(script: 'terraform output -raw instance_id', returnStdout: true).trim()
-
-                        echo "Provisioned IP: ${env.INSTANCE_IP}"
-                        bat "echo ${env.INSTANCE_IP} > dynamic_inventory.ini"
+                        def ipRaw = bat(script: "terraform output -raw instance_ip", returnStdout: true).trim()
+                        // Clean up Windows command output artifacts if necessary
+                        env.INSTANCE_IP = ipRaw.readLines().last().trim() 
+                        echo "Instance IP is: ${env.INSTANCE_IP}"
                     }
                 }
             }
         }
 
-        stage('Wait for AWS Instance Status') {
+        stage('Wait for Instance Boot') {
             steps {
-                withCredentials([aws(credentialsId: 'AWS_Aadii', accesskeyVariable: 'AWS_ACCESS_KEY_ID', secretkeyVariable: 'AWS_SECRET_ACCESS_KEY')]) {
-                    echo "Waiting for instance ${env.INSTANCE_ID} to pass AWS system health checks..."
-                    bat "aws ec2 wait instance-status-ok --instance-ids ${env.INSTANCE_ID} --region ${env.AWS_REGION}"
-                }
+                echo "Waiting 60 seconds for EC2 to initialize..."
+                sleep 60 
             }
         }
 
-        stage('Wait for SSH Readiness') {
+        // --- MANUAL STEP 1: ASK TO RUN ANSIBLE ---
+        stage('Approval for Configuration') {
+            input {
+                message "Instance Launched (${env.INSTANCE_IP}). Install Grafana via Ansible?"
+                ok "Yes, Configure"
+            }
             steps {
-                script {
-                    echo "Checking SSH (Port 22) accessibility on ${env.INSTANCE_IP}..."
-                    def sshReady = false
-                    // Retry loop to account for OS boot time
-                    for (int i = 0; i < 12; i++) { 
-                        def result = powershell(script: "Test-NetConnection -ComputerName ${env.INSTANCE_IP} -Port 22 -WarningAction SilentlyContinue | Select-Object -ExpandProperty TcpTestSucceeded", returnStdout: true).trim()
-                        if (result == "True") {
-                            echo "✅ SSH Port is open and reachable."
-                            sshReady = true
-                            break
-                        }
-                        echo "⏳ SSH not ready, retrying in 10s... (Attempt ${i+1}/12)"
-                        sleep 10
+                echo "Proceeding with Ansible..."
+            }
+        }
+
+        stage('Run Ansible (WSL)') {
+            steps {
+                // Using your 'Aadii_new' SSH key
+                withCredentials([sshUserPrivateKey(credentialsId: 'Aadii_new', keyFileVariable: 'SSH_KEY')]) {
+                    script {
+                         // We must generate the inventory file dynamically on Windows first
+                         bat "echo [web] > inventory.ini"
+                         bat "echo %INSTANCE_IP% >> inventory.ini"
+
+                         // Pass the Windows path key to WSL and run Ansible
+                         bat """
+                            @echo off
+                            :: 1. Copy key to a temp location in WSL so permissions work (chmod 400)
+                            wsl cp \$(wslpath '%SSH_KEY%') /tmp/Aadii_new.pem
+                            wsl chmod 400 /tmp/Aadii_new.pem
+
+                            :: 2. Run Ansible Playbook using WSL
+                            :: Note: We map the Windows 'inventory.ini' to the WSL path
+                            wsl ansible-playbook -i inventory.ini playbook.yml --private-key /tmp/Aadii_new.pem -u ubuntu --ssh-common-args='-o StrictHostKeyChecking=no'
+
+                            :: 3. Cleanup key
+                            wsl rm /tmp/Aadii_new.pem
+                         """
                     }
-                    if (!sshReady) {
-                        error "❌ SSH service failed to respond on ${env.INSTANCE_IP} after 2 minutes."
-                    }
                 }
             }
         }
 
-        // --- THIS IS THE SAFETY CHECK FOR ANSIBLE ---
-        stage('Validate Ansible') {
+        // --- MANUAL STEP 2: ASK TO DESTROY ---
+        stage('Approval for Destroy') {
+            input {
+                message "Testing Complete. Destroy Infrastructure?"
+                ok "Yes, Destroy"
+            }
             steps {
-                script {
-                    // This creates a pause in the Jenkins UI. 
-                    // You must click "Proceed" to continue to the WSL command.
-                    input message: "Infrastructure is healthy and SSH is ready. Run Ansible playbook via WSL?", ok: "Run Ansible"
-                }
+                echo "Destroying..."
             }
         }
 
-        stage('Ansible Configuration') {
+        stage('Terraform Destroy') {
             steps {
-                echo "Running Ansible via WSL Bridge..."
-                // WSL command runs non-interactively because we already got approval above
-                bat "wsl ansible-playbook -i dynamic_inventory.ini grafana_playbook.yml -u ubuntu --private-key ${env.WSL_SSH_KEY}"
-            }
-        }
-
-        stage('Ansible Testing') {
-            steps {
-                echo "Testing Grafana access..."
-                bat "wsl ansible-playbook -i dynamic_inventory.ini test_grafana.yml -u ubuntu --private-key ${env.WSL_SSH_KEY}"
-            }
-        }
-
-        stage('Manual Destroy') {
-            steps {
-                input message: "Testing finished. Destroy infrastructure for ${env.CLEAN_BRANCH}?", ok: "Destroy Now"
-                
-                withCredentials([aws(credentialsId: 'AWS_Aadii', accesskeyVariable: 'AWS_ACCESS_KEY_ID', secretkeyVariable: 'AWS_SECRET_ACCESS_KEY')]) {
-                    bat "terraform destroy -auto-approve -var-file=${env.CLEAN_BRANCH}.tfvars"
-                }
-            }
-        }
-    }
-
-    post {
-        always {
-            bat 'if exist dynamic_inventory.ini del /f dynamic_inventory.ini'
-        }
-        success {
-            echo "✅ Deployment on branch '${env.CLEAN_BRANCH}' completed successfully!"
-        }
-        failure {
-            script {
-                if (env.CLEAN_BRANCH) {
-                    withCredentials([aws(credentialsId: 'AWS_Aadii', accesskeyVariable: 'AWS_ACCESS_KEY_ID', secretkeyVariable: 'AWS_SECRET_ACCESS_KEY')]) {
-                        echo "🚨 Pipeline failed. Attempting automated cleanup for ${env.CLEAN_BRANCH}..."
-                        bat "terraform destroy -auto-approve -var-file=${env.CLEAN_BRANCH}.tfvars || echo 'Manual cleanup required'"
-                    }
+                withCredentials([usernamePassword(credentialsId: 'AWS_Aadii', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                    bat "terraform destroy -auto-approve"
                 }
             }
         }
