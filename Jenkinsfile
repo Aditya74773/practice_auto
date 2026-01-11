@@ -15,8 +15,8 @@ pipeline {
 
         stage('Terraform Init & Plan') {
             steps {
-                // EXPLICITLY binding keys to standard AWS env vars to fix "Access Key Error"
-                withCredentials([usernamePassword(credentialsId: 'AWS_Aadii', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                // FIXED: Using AmazonWebServicesCredentialsBinding instead of usernamePassword
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'AWS_Aadii', accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
                     bat "terraform init"
                     bat "terraform plan -out=tfplan"
                 }
@@ -25,13 +25,13 @@ pipeline {
 
         stage('Terraform Apply (Provision)') {
             steps {
-                withCredentials([usernamePassword(credentialsId: 'AWS_Aadii', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'AWS_Aadii', accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
                     bat "terraform apply -auto-approve tfplan"
                     
-                    // Capture IP and save to environment variable for later stages
                     script {
+                        // Capture IP
                         def ipRaw = bat(script: "terraform output -raw instance_ip", returnStdout: true).trim()
-                        // Clean up Windows command output artifacts if necessary
+                        // Filter just the last line to get the clean IP
                         env.INSTANCE_IP = ipRaw.readLines().last().trim() 
                         echo "Instance IP is: ${env.INSTANCE_IP}"
                     }
@@ -46,7 +46,7 @@ pipeline {
             }
         }
 
-        // --- MANUAL STEP 1: ASK TO RUN ANSIBLE ---
+        // --- MANUAL STEP 1: CONFIGURATION ---
         stage('Approval for Configuration') {
             input {
                 message "Instance Launched (${env.INSTANCE_IP}). Install Grafana via Ansible?"
@@ -59,25 +59,18 @@ pipeline {
 
         stage('Run Ansible (WSL)') {
             steps {
-                // Using your 'Aadii_new' SSH key
                 withCredentials([sshUserPrivateKey(credentialsId: 'Aadii_new', keyFileVariable: 'SSH_KEY')]) {
                     script {
-                         // We must generate the inventory file dynamically on Windows first
                          bat "echo [web] > inventory.ini"
                          bat "echo %INSTANCE_IP% >> inventory.ini"
 
-                         // Pass the Windows path key to WSL and run Ansible
                          bat """
                             @echo off
-                            :: 1. Copy key to a temp location in WSL so permissions work (chmod 400)
                             wsl cp \$(wslpath '%SSH_KEY%') /tmp/Aadii_new.pem
                             wsl chmod 400 /tmp/Aadii_new.pem
 
-                            :: 2. Run Ansible Playbook using WSL
-                            :: Note: We map the Windows 'inventory.ini' to the WSL path
                             wsl ansible-playbook -i inventory.ini playbook.yml --private-key /tmp/Aadii_new.pem -u ubuntu --ssh-common-args='-o StrictHostKeyChecking=no'
 
-                            :: 3. Cleanup key
                             wsl rm /tmp/Aadii_new.pem
                          """
                     }
@@ -85,7 +78,7 @@ pipeline {
             }
         }
 
-        // --- MANUAL STEP 2: ASK TO DESTROY ---
+        // --- MANUAL STEP 2: DESTROY ---
         stage('Approval for Destroy') {
             input {
                 message "Testing Complete. Destroy Infrastructure?"
@@ -98,7 +91,7 @@ pipeline {
 
         stage('Terraform Destroy') {
             steps {
-                withCredentials([usernamePassword(credentialsId: 'AWS_Aadii', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'AWS_Aadii', accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
                     bat "terraform destroy -auto-approve"
                 }
             }
